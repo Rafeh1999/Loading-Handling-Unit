@@ -1,0 +1,87 @@
+# Search logs from both equipment and application sources for the ZLXH site
+(index=uds_equipment sourcetype="equipment.log") 
+OR (index=uds_application sourcetype="uds.core.log") 
+site=ZLXH 
+Function="validate*" 
+Event IN ("ReceiveMessage","SendMessage") 
+
+# Convert raw message data into JSON for structured parsing
+| tojson output_field=my_JSON_field 
+
+# Extract sort area name from the source field using regex
+| rex field=source "Core\.(?<sort_area>\w+)" 
+
+# Join with lookup file to classify the sort area type
+| lookup sort_area_type.csv area_name as sort_area output area_type as sort_area_type 
+
+# Filter to include only Direct Handling (DH) sort areas
+| search sort_area_type=DH 
+
+# Extract fields from nested JSON payloads
+| eval loading_unit=coalesce(json_extract(Message,"Barcode"),json_extract(Message,"LoadingUnit.Barcode")) 
+| eval handling_unit=json_extract(Message,"HandlingUnit.Barcode") 
+| eval tracking_number=json_extract(Message,"TrackingNumber") 
+| eval result=json_extract(Message,"Result") 
+| eval sort_plan=json_extract(Message,"SplitName.SortPlanName") 
+| eval type=json_extract(Message,"Type") 
+| eval sort_area=json_extract(Message,"SplitName.AreaName") 
+| eval origin=json_extract(Message,"Origin") 
+| eval destination=json_extract(Message,"Destination") 
+| eval scan_user_id=json_extract(Message,"ScanUserId") 
+| eval device_id=json_extract(Message,"DeviceId") 
+| eval scan_date_time=json_extract(Message,"ScanDateTime") 
+| eval sort_rule=json_extract(Message,"SplitName.ShortName") 
+| eval sort_rule_type=json_extract(Message,"SortedByRuleType") 
+
+# Keep only the relevant fields for tracking and analytics
+| table _time site Event Function Context loading_unit handling_unit tracking_number result sort_plan type sort_area origin destination scan_user_id device_id scan_date_time sort_rule sort_rule_type 
+
+# Reduce fields to a cleaner view
+| fields handling_unit, loading_unit, scan_date_time, Function, site 
+| table loading_unit, handling_unit, scan_date_time 
+
+# Filter out blank handling units and unreasonably long ones
+| where handling_unit != "" 
+| where len(handling_unit) < 40 
+
+# Append LU creation events from the last week for enrichment
+| append maxout=500000 
+    [ 
+    search (index=uds_equipment sourcetype="equipment.log") 
+    OR (index=uds_application sourcetype="uds.core.log") 
+    site=ZLXH earliest=1751151600.000000 
+    Event IN ("ReceiveMessage","SendMessage") 
+    Function="newconscreated" 
+    
+    # Convert message to JSON and extract structured data
+    | tojson output_field=my_JSON_field 
+    | rex field=source "Core\.(?<sort_area>\w+)" 
+    | lookup sort_area_type.csv area_name as sort_area output area_type as sort_area_type 
+    | search sort_area_type=DH 
+    | eval loading_unit=coalesce(json_extract(Message,"Barcode"),json_extract(Message,"LoadingUnit.Barcode")) 
+    | eval sort_plan=json_extract(Message,"SplitName.SortPlanName") 
+    | eval sort_rule=json_extract(Message,"SplitName.ShortName") 
+    | eval sort_rule_type=json_extract(Message,"SortedByRuleType") 
+    | table _time Function loading_unit sort_plan sort_rule 
+    | search loading_unit>0 
+    | table loading_unit, sort_plan, sort_rule 
+    ] 
+
+# Group by LU and collect associated HU, scan time, and sorting info
+| stats list(handling_unit) as handling_unit, list(scan_date_time) as scan_date_time, values(sort_plan) as sort_plan, values(sort_rule) as sort_rule by loading_unit 
+
+# Keep only entries where HUs were found
+| where isnotnull(handling_unit) 
+
+# Zip handling unit and scan time together into a temporary field
+| eval temp=mvzip(handling_unit,scan_date_time,"::::")
+
+# Expand multivalue temp into individual rows
+| mvexpand temp
+
+# Split the zipped string back into original fields
+| eval temp = split(temp,"::::")
+| eval handling_unit=mvindex(temp,0), scan_date_time=mvindex(temp,1)
+
+# Clean up temporary fields
+| fields - temp
